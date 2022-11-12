@@ -63,6 +63,15 @@ u32 get_hash(Span<utf8> str) {
 	return hash;
 }
 
+v4f color_u32_to_v4f(u32 rgba) {
+	return v4f{
+		(f32)((rgba >> (8*2)) & 0xff),
+		(f32)((rgba >> (8*1)) & 0xff),
+		(f32)((rgba >> (8*0)) & 0xff),
+		255,
+	} / 255;
+}
+
 s32 tl_main(Span<Span<utf8>> arguments) {
 	init_allocator();
 	defer { deinit_allocator(); };
@@ -79,7 +88,7 @@ s32 tl_main(Span<Span<utf8>> arguments) {
 	font_collection = create_font_collection(font_paths);
 	font_collection->update_atlas = [](umm texture, void *data, v2u size) {
 		if (!texture) {
-			glGenTextures(1, &texture);
+			glGenTextures(1, (GLuint *)&texture);
 			glBindTexture(GL_TEXTURE_2D, texture);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
@@ -140,7 +149,18 @@ s32 tl_main(Span<Span<utf8>> arguments) {
 				return end - start;
 			}
 		};
-		static std::unordered_map<u32, List<EventToDraw>> thread_id_to_events_to_draw;
+
+		struct Mark {
+			v4f color;
+			s64 time;
+		};
+
+		struct ThreadDrawList {
+			List<EventToDraw> events;
+			List<Mark> marks;
+		};
+
+		static std::unordered_map<u32, ThreadDrawList> thread_id_to_events_to_draw;
 		static s64 events_start = 0;
 		static s64 events_end = 0;
 		static s64 events_duration = 0;
@@ -220,7 +240,8 @@ s32 tl_main(Span<Span<utf8>> arguments) {
 										events_buffer = read_entire_file(tracker.path);
 										if (events_buffer.data) {
 											for (auto &[thread_id, events_to_draw] : thread_id_to_events_to_draw) {
-												free(events_to_draw);
+												free(events_to_draw.events);
+												free(events_to_draw.marks);
 											}
 											thread_id_to_events_to_draw.clear();
 											event_groups.clear();
@@ -228,24 +249,56 @@ s32 tl_main(Span<Span<utf8>> arguments) {
 											events_start = max_value<s64>;
 											events_end = min_value<s64>;
 
-											auto event = (Event *)events_buffer.data;
-											while (event) {
+											u8 *cursor = events_buffer.data;
+
+#define read(type, name) \
+	auto name = *(type *)cursor; \
+	cursor += sizeof(type)
+
+#define read_in(type, name) \
+	name = *(type *)cursor; \
+	cursor += sizeof(type)
+
+											read(u32, event_count);
+
+											while (event_count--) {
+												//append_bytes(builder, (s64)(span.begin * nanoseconds_in_second / performance_frequency));
+												//append_bytes(builder, (s64)(span.end   * nanoseconds_in_second / performance_frequency));
+												//append_bytes(builder, (u32)span.thread_id);
+												//append_bytes(builder, (u16)span.name.count);
+												//append_bytes(builder, span.name);
+
 												EventToDraw d = {};
-												d.name = {event->name, event->name_size};
-												d.start = event->start;
-												d.end = event->end;
+
+												read_in(s64, d.start);
+												read_in(s64, d.end);
+												read(u32, thread_id);
+												read_in(u16, d.name.size);
+
+												d.name.data = (utf8 *)cursor;
+												cursor += d.name.size;
+
 												d.color = hsv_to_rgb(random_f32(get_hash(d.name)), 0.75f, 1);
 												d.self_duration = d.duration();
-												thread_id_to_events_to_draw[event->thread_id].add(d);
+												thread_id_to_events_to_draw[thread_id].events.add(d);
 
 												events_start = min(events_start, d.start);
 												events_end = max(events_end, d.end);
-
-												event = (Event *)((u8 *)event->name + event->name_size);
-												if ((u8 *)event > events_buffer.end() - sizeof(Event) || ((u8 *)event->name + event->name_size) > events_buffer.end()) {
-													break;
-												}
 											}
+
+											read(u32, mark_count);
+											while (mark_count--) {
+												Span<utf8> name;
+
+												read(s64, time);
+												read(u32, thread_id);
+												read(u32, color);
+
+												thread_id_to_events_to_draw[thread_id].marks.add({color_u32_to_v4f(color), time});
+
+												events_start = min(events_start, time);
+											}
+
 
 											events_duration = events_end - events_start;
 
@@ -253,7 +306,7 @@ s32 tl_main(Span<Span<utf8>> arguments) {
 											events_scroll_amount = events_target_scroll_amount = 0;
 
 											for (auto &[thread_id, events_to_draw] : thread_id_to_events_to_draw) {
-												std::sort(events_to_draw.begin(), events_to_draw.end(), [](EventToDraw const &a, EventToDraw const &b) {
+												std::sort(events_to_draw.events.begin(), events_to_draw.events.end(), [](EventToDraw const &a, EventToDraw const &b) {
 													if (a.start == b.start) {
 														return a.duration() > b.duration();
 													}
@@ -263,7 +316,7 @@ s32 tl_main(Span<Span<utf8>> arguments) {
 												List<EventToDraw *> parent_events;
 												parent_events.allocator = temporary_allocator;
 
-												for (auto &event : events_to_draw) {
+												for (auto &event : events_to_draw.events) {
 													//
 													// Insert group
 													//
@@ -319,6 +372,10 @@ s32 tl_main(Span<Span<utf8>> arguments) {
 														parent_events.add(&event);
 													}
 												}
+
+												for (auto &mark : events_to_draw.marks) {
+													mark.time -= events_start;
+												}
 											}
 
 											std::sort(event_groups.begin(), event_groups.end(), [](EventGroup const &a, EventGroup const &b) {
@@ -356,6 +413,7 @@ s32 tl_main(Span<Span<utf8>> arguments) {
 		Imgui::split(split);
 
 		s32 const side_panel_width = 256;
+		s32 button_height = 18;
 		{
 			Imgui::begin_region(split.half[0]);
 			auto [sort_rect, content_rect] = Imgui::split(24, Imgui::Dock_top).data;
@@ -370,7 +428,6 @@ s32 tl_main(Span<Span<utf8>> arguments) {
 			{
 				Imgui::begin_region(content_rect);
 
-				s32 button_height = 24;
 				s32 start_y = 0;
 
 				button.content_padding = 0;
@@ -402,10 +459,8 @@ s32 tl_main(Span<Span<utf8>> arguments) {
 			defer { Imgui::end_region(); };
 
 			auto event = (Event *)events_buffer.data;
-			s32 button_height = 24;
 
 			s32 start_y = button_height;
-			s32 max_depth = 0;
 
 			if (key_down('X')) {
 				events_view_scale = 1000000;
@@ -454,6 +509,8 @@ s32 tl_main(Span<Span<utf8>> arguments) {
 			button.content_padding = 0;
 			button.background_color.w = 0.5f;
 			for (auto &[thread_id, events_to_draw] : thread_id_to_events_to_draw) {
+				s32 max_depth = 0;
+
 				button.text = tformat(u8"Thread %", thread_id);
 				button.rect = aabb_min_max(v2s{0, start_y}, v2s{(s32)window.client_size.x,start_y + button_height});
 				button.text_alignment = Imgui::TextAlignment_top_left;
@@ -464,7 +521,16 @@ s32 tl_main(Span<Span<utf8>> arguments) {
 				++button.id;
 				start_y += button_height;
 				button.align_text_to_visible_rect = true;
-				for (auto &event : events_to_draw) {
+
+				for (auto &mark : events_to_draw.marks) {
+					aabb<v2s> rect;
+					rect.min.x = mark.time / events_view_scale + events_scroll_amount;
+					rect.max.x = rect.min.x + 1;
+					rect.min.y = start_y;
+					rect.max.y = start_y + button_height * 1;
+					Imgui::panel(rect, mark.color);
+				}
+				for (auto &event : events_to_draw.events) {
 					button.rect.min.x = event.start / events_view_scale + events_scroll_amount;
 					button.rect.max.x = max(event.end   / events_view_scale + events_scroll_amount, button.rect.min.x + 1);
 					button.rect.min.y = start_y + button_height * (event.depth + 0);
@@ -484,8 +550,25 @@ s32 tl_main(Span<Span<utf8>> arguments) {
 					}
 					max_depth = max(max_depth, event.depth);
 				}
+
 				start_y += (max_depth + 1) * button_height;
 			}
+
+			/*
+				for (auto mark : marks) {
+					button.rect = aabb_min_max(
+						v2s{
+							0,
+							groups_scroll_amount+start_y
+						},
+						{
+							Imgui::current_region.rect.size().x-16,
+							groups_scroll_amount+start_y + button_height
+						}
+					);
+					Imgui::panel();
+				}*/
+
 
 			Imgui::ScrollBar<f64> scroll_bar;
 			scroll_bar.rect = Imgui::get_dock(16, Imgui::Dock_bottom);
